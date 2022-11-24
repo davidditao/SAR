@@ -25,7 +25,7 @@
 }
 
 void checkResultGPU(float *hostRef, float *gpuRef, const int N) {
-    double epsilon = 1.0E-8;
+    float epsilon = 1.0E-8;
 
     int printLimit = 1;
     int cnt = 0;
@@ -48,7 +48,7 @@ void checkResultGPU(float *hostRef, float *gpuRef, const int N) {
 }
 
 void checkResultCPU(float **host2d, float *host1d, const int nx, const int ny) {
-    double epsilon = 1.0E-8;
+    float epsilon = 1.0E-8;
 
     int idx = 0;
     for (int i = 0; i < nx; i++) {
@@ -171,30 +171,41 @@ __global__ void backscatterComputeGPU(float *g_sigma, int Nx, int Ny, float *g_M
         float theta1 = atan(d * m / (Z_s0 - z0));
 
         // 局部入射角 theta : [-pi/2, pi/2]
-        float theta = acos((abs(b * sin(theta1) + cos(theta1))) / sqrt(a * a + b * b + 1));
+        float theta;
+        float dividend = abs(b * sin(theta1) + cos(theta1));
+        float divisor = sqrt(a * a + b * b + 1);
+        if (abs(dividend - divisor) < 1e-6) { // 防止出现 -nan
+            theta = 0;
+        } else {
+            theta = acos(dividend / divisor);
+        }
 
         // 后向散射系数：Muhleman 半经验模型
         // g_sigma[x * Ny + y] = 10 * log10(0.0133 * cos(theta) / pow((sin(theta) + 0.1 * cos(theta)), 3));
 
         // currie: 《典型地形的 SAR 回波模拟及快速实现》张吉宇 p25
-        float S = m * m * sqrt(a * a + b * b + 1);
-        float avgh = (z1 + z2 + z3 + z4) / 4;
-        float sigma_h = sqrt((z1 - avgh) * (z1 - avgh) + (z2 - avgh)  * (z2 - avgh) + (z3 - avgh) * (z3 - avgh) + (z4 -avgh) * (z4 - avgh)) / 3;
+        float S = m * m * sqrt(a * a + b * b + 1); // 小面元的截面积
+        float avgh = (z1 + z2 + z3 + z4) / 4; // 高度平均值
+        float sigma_h = sqrt((z1 - avgh) * (z1 - avgh) + (z2 - avgh) * (z2 - avgh) + (z3 - avgh) * (z3 - avgh) +
+                             (z4 - avgh) * (z4 - avgh)) / 3; // 标准差
+
         // 树林
         float A = 0.00054;
         float B = 0.64;
         float C = 0.02;
         float D = 0;
 
-        float lambda = 0.06;
+        float lambda = 0.06; // 这个波长需要外面计算好
 
         float sigma_a = A * pow(C + theta, B) * exp(-D * lambda / (0.1 * sigma_h + lambda));
         g_sigma[x * Ny + y] = sigma_a * S * cos(theta) * cos(theta);
     }
 }
 
-__global__ void imageSimulationGPU(float *g_img, int Nx, int Ny, float *g_M, float *g_sigma, float *g_shadow,
-                                   float m, float Y_s0, float Z_s0, float R_0, float M_s) {
+__global__ void
+imageSimulationGPU(float *g_img, int imgNy, int miny, int delta, int Nx, int Ny, float *g_M, float *g_sigma,
+                   float *g_shadow,
+                   float m, float Y_s0, float Z_s0, float R_0, float M_s) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -203,10 +214,7 @@ __global__ void imageSimulationGPU(float *g_img, int Nx, int Ny, float *g_M, flo
         int Y = ceil(
                 (sqrt((y * m - Y_s0) * (y * m - Y_s0) + (g_M[x * Ny + y] - Z_s0) * (g_M[x * Ny + y] - Z_s0)) - R_0) /
                 M_s);
-        if (Y > 0 && Y < Ny) {
-            atomicAdd(&g_img[x * Ny + Y], g_sigma[x * Ny + y] * g_shadow[x * Ny + y]);
-//            g_img[x * Ny + Y] += g_sigma[x * Ny + y] * g_shadow[x * Ny + y];
-        }
+        atomicAdd(&g_img[x * imgNy + (Y - miny + delta)], g_sigma[x * Ny + y] * g_shadow[x * Ny + y]);
     }
 }
 
@@ -222,18 +230,60 @@ void GPU() {
     LARGE_INTEGER iStart, iEnd, tc;
     QueryPerformanceFrequency(&tc);
 
-    /*---------------------------create a cone model----------------------*/
-    const int cone_row = 1024, cone_col = 2000;
-    int nx = cone_row, ny = cone_col;
+//    /*---------------------------create a cone model----------------------*/
+//    const int cone_row = 1024, cone_col = 2000;
+//    int nx = cone_row, ny = cone_col;
+//    int nxy = nx * ny;
+//    int nBytes = nxy * sizeof(float);
+//
+//    float *cone = (float *) malloc(nBytes);
+//    memset(cone, 0, nBytes);
+//
+//    // allocate device memory
+//    float *g_cone = NULL;
+//    cudaMalloc((void **) &g_cone, nBytes);
+//
+//    // execution configuration
+//    int dimx = 32;
+//    int dimy = 32;
+//    dim3 block(dimx, dimy);
+//    dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
+//
+//    // kernel: createConeGPU
+//    QueryPerformanceCounter(&iStart);
+//
+//    createConeGPU<<<grid, block>>>(g_cone, cone_row, cone_col);
+//
+//    CHECK(cudaDeviceSynchronize());
+//    QueryPerformanceCounter(&iEnd);
+//    printf("\t[ createConeGPU\t\t<<<(%d,%d), (%d,%d)>>> ] \telapsed %f s\n",
+//           grid.x, grid.y, block.x, block.y,
+//           (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart
+//    );
+//
+//    CHECK(cudaGetLastError());
+//
+//    // copy kernel result back to host side
+//    CHECK(cudaMemcpy(cone, g_cone, nBytes, cudaMemcpyDeviceToHost));
+
+    /*------------------------------导入数据-----------------------------------*/
+    QueryPerformanceCounter(&iStart);
+
+    int nx = 0, ny = 0;
+    vector<float> DEM = load(nx, ny);
     int nxy = nx * ny;
     int nBytes = nxy * sizeof(float);
 
-    float *cone = (float *) malloc(nBytes);
-    memset(cone, 0, nBytes);
+    float *M = (float *) malloc(nBytes);
 
-    // allocate device memory
-    float *g_cone = NULL;
-    cudaMalloc((void **) &g_cone, nBytes);
+    for (int i = 0; i < nxy; i++) {
+        M[i] = DEM[i];
+    }
+
+    // copy data to device side
+    float *g_M = NULL;
+    CHECK(cudaMalloc((void **) &g_M, nBytes));
+    CHECK(cudaMemcpy(g_M, M, nBytes, cudaMemcpyHostToDevice));
 
     // execution configuration
     int dimx = 32;
@@ -241,32 +291,17 @@ void GPU() {
     dim3 block(dimx, dimy);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
-    // kernel: createConeGPU
-    QueryPerformanceCounter(&iStart);
-
-    createConeGPU<<<grid, block>>>(g_cone, cone_row, cone_col);
-
-    CHECK(cudaDeviceSynchronize());
     QueryPerformanceCounter(&iEnd);
-    printf("\t[ createConeGPU\t\t<<<(%d,%d), (%d,%d)>>> ] \telapsed %f s\n",
-           grid.x, grid.y, block.x, block.y,
-           (double) (iEnd.QuadPart - iStart.QuadPart) / (double) tc.QuadPart
-    );
-
-    CHECK(cudaGetLastError());
-
-    // copy kernel result back to host side
-    CHECK(cudaMemcpy(cone, g_cone, nBytes, cudaMemcpyDeviceToHost));
+    printf("\t[ loading DEM data ] \t\t\t\t\telapsed %f s\n\n", (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart);
 
     /*------------------------------雷达参数-----------------------------------*/
-
-    float *M = cone; // load data
-    float *g_M = g_cone;
-
     // 雷达初始位置
     float X_s0 = 0;
-    float Y_s0 = -2000;
-    float Z_s0 = 1730;
+//    float Y_s0 = -2000;
+//    float Z_s0 = 1730;
+
+    float Y_s0 = -5000;
+    float Z_s0 = 5000;
 
     float R_0 = sqrt((Y_s0 / 2) * (Y_s0 / 2) + Z_s0 * Z_s0); // 近距延迟 sqrt((y/2)^2 + z^2)
 
@@ -294,9 +329,9 @@ void GPU() {
 
     CHECK(cudaDeviceSynchronize());
     QueryPerformanceCounter(&iEnd);
-    printf("\t[ shadowComputeGPU\t<<<(%d,%d), (%d,%d)>>> ] \t\telapsed %f s\n",
+    printf("\t[ shadowComputeGPU\t<<<(%d,%d), (%d,%d)>>> ] \t\telapsed %f s\n\n",
            grid.x, grid.y, block.x, block.y,
-           (double) (iEnd.QuadPart - iStart.QuadPart) / (double) tc.QuadPart
+           (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart
     );
 
     CHECK(cudaGetLastError());
@@ -323,9 +358,9 @@ void GPU() {
 
     CHECK(cudaDeviceSynchronize());
     QueryPerformanceCounter(&iEnd);
-    printf("\t[ backscatterComputeGPU\t<<<(%d,%d), (%d,%d)>>> ] \telapsed %f s\n",
+    printf("\t[ backscatterComputeGPU\t<<<(%d,%d), (%d,%d)>>> ] \telapsed %f s\n\n",
            grid.x, grid.y, block.x, block.y,
-           (double) (iEnd.QuadPart - iStart.QuadPart) / (double) tc.QuadPart
+           (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart
     );
 
     CHECK(cudaGetLastError());
@@ -333,45 +368,90 @@ void GPU() {
     // copy kernel result back to host side
     CHECK(cudaMemcpy(sigma, g_sigma, nBytes, cudaMemcpyDeviceToHost));
 
+    /*------------------------------调整输出图像的大小-------------------------------*/
+    QueryPerformanceCounter(&iStart);
+
+    // 可用并行归约优化！
+    printf("adjusting the size of output image...\n");
+    // 只有图像的宽度范围需要调整
+    int miny = 1e5, maxy = -1e5;
+
+    for (int x = 0; x < nx - 1; x++) {
+        for (int y = 0; y < ny - 1; y++) {
+            // Leberl 构像模型计算模拟 SAR 图像的纵坐标
+            int Y = ceil(
+                    (sqrt((y * m - Y_s0) * (y * m - Y_s0) + (M[x * ny + y] - Z_s0) * (M[x * ny + y] - Z_s0)) - R_0) /
+                    M_s);
+
+            if (Y < miny) {
+                miny = Y;
+            }
+            if (Y > maxy) {
+                maxy = Y;
+            }
+        }
+    }
+
+    int delta = 100; // 左右留空
+    int imgNx = nx;
+    int imgNy = (maxy - miny) + 2 * delta;
+    int imgSize = imgNx * imgNy;
+
+    QueryPerformanceCounter(&iEnd);
+    printf("\t[ adjusting the size of output image ] \t\t\telapsed %f s\n\n",
+           (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart
+    );
+
     /*------------------------------SAR模拟-----------------------------------*/
-    float *img = (float *) malloc(nBytes);
-    memset(img, 0, nBytes);
+    float *img = (float *) malloc(imgSize * sizeof(float));
+    memset(img, 0, imgSize * sizeof(float));
 
     // allocate device memory
     float *g_img = NULL;
-    CHECK(cudaMalloc((void **) &g_img, nBytes));
+    CHECK(cudaMalloc((void **) &g_img, imgSize * sizeof(float)));
 
     // execution configuration
 
     // kernel: imageSimulationGPU
     QueryPerformanceCounter(&iStart);
 
-    imageSimulationGPU<<<grid, block>>>(g_img, nx, ny, g_M, g_sigma, g_shadow, m, Y_s0, Z_s0, R_0, M_s);
+    imageSimulationGPU<<<grid, block>>>(g_img, imgNy, miny, delta, nx, ny, g_M, g_sigma, g_shadow, m, Y_s0, Z_s0, R_0,
+                                        M_s);
 
     CHECK(cudaDeviceSynchronize());
     QueryPerformanceCounter(&iEnd);
-    printf("\t[ imageSimulationGPU\t<<<(%d,%d), (%d,%d)>>> ] \telapsed %f s\n",
+    printf("\t[ imageSimulationGPU\t<<<(%d,%d), (%d,%d)>>> ] \telapsed %f s\n\n",
            grid.x, grid.y, block.x, block.y,
-           (double) (iEnd.QuadPart - iStart.QuadPart) / (double) tc.QuadPart
+           (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart
     );
 
     CHECK(cudaGetLastError());
 
     // copy kernel result back to host side
-    CHECK(cudaMemcpy(img, g_img, nBytes, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(img, g_img, imgSize * sizeof(float), cudaMemcpyDeviceToHost));
 
     /*-----------------------------------------------------------------------*/
     // 归一化为灰度图像
 
-    // 保存
-    saveMatrix(img, nx, ny, "img");
+    /*-----------------------------------保存图像----------------------------*/
+    QueryPerformanceCounter(&iStart);
 
-    free(cone);
+    saveMatrix(img, imgNx, imgNy, "img");
+
+    QueryPerformanceCounter(&iEnd);
+    printf("\t[ imageSimulationGPU\t<<<(%d,%d), (%d,%d)>>> ] \telapsed %f s\n\n",
+           grid.x, grid.y, block.x, block.y,
+           (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart
+    );
+
+    printf("done.\n");
+    /*-----------------------------------释放资源---------------------------*/
+    free(M);
     free(shadow);
     free(sigma);
     free(img);
 
-    CHECK(cudaFree(g_cone));
+    CHECK(cudaFree(g_M));
     CHECK(cudaFree(g_shadow));
     CHECK(cudaFree(g_sigma));
     CHECK(cudaFree(g_img));
@@ -403,39 +483,58 @@ void CPU() {
     LARGE_INTEGER iStart, iEnd, tc;
     QueryPerformanceFrequency(&tc);
 
-    /*---------------------------create a cone model----------------------*/
+//    /*---------------------------create a cone model----------------------*/
+//    QueryPerformanceCounter(&iStart);
+//    const int cone_row = 1024, cone_col = 2000;
+//    int nx = cone_row, ny = cone_col;
+//    int nxy = nx * ny;
+//    int nBytes = nxy * sizeof(float);
+//
+//    float *cone = (float *) malloc(nBytes);
+//
+//    memset(cone, 0, nBytes);
+//
+//    for (int i = 0; i < nx; i++) {
+//        for (int j = 0; j < ny; j++) {
+//            for (int k = 0; k < 400; k++) {
+//                if ((i - 512) * (i - 512) + (j - 700) * (j - 700) < k * k) {
+//                    cone[i * ny + j]++;
+//                }
+//            }
+//        }
+//    }
+//    QueryPerformanceCounter(&iEnd);
+//    printf("create cone elapsed %f s\n", (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart);
+//
+////    saveMatrix(cone, nx, ny, "gpuCone");
+
+    /*------------------------------导入数据-----------------------------------*/
     QueryPerformanceCounter(&iStart);
-    const int cone_row = 1024, cone_col = 2000;
-    int nx = cone_row, ny = cone_col;
+
+    int nx = 0, ny = 0;
+    vector<float> DEM = load(nx, ny);
     int nxy = nx * ny;
     int nBytes = nxy * sizeof(float);
 
-    float *cone = (float *) malloc(nBytes);
+    float *M = (float *) malloc(nBytes);
 
-    memset(cone, 0, nBytes);
-
-    for (int i = 0; i < nx; i++) {
-        for (int j = 0; j < ny; j++) {
-            for (int k = 0; k < 400; k++) {
-                if ((i - 512) * (i - 512) + (j - 700) * (j - 700) < k * k) {
-                    cone[i * ny + j]++;
-                }
-            }
-        }
+    for (int i = 0; i < nxy; i++) {
+        M[i] = DEM[i];
     }
-    QueryPerformanceCounter(&iEnd);
-    printf("create cone elapsed %f s\n", (double) (iEnd.QuadPart - iStart.QuadPart) / (double) tc.QuadPart);
 
-//    saveMatrix(cone, nx, ny, "gpuCone");
+    QueryPerformanceCounter(&iEnd);
+    printf("loading DEM data elapsed %f s\n", (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart);
 
     /*------------------------------雷达参数-----------------------------------*/
 
-    float *M = cone; // load data
+//    float *M = cone; // load data
 
     // 雷达初始位置
     float X_s0 = 0;
-    float Y_s0 = -2000;
-    float Z_s0 = 1730;
+//    float Y_s0 = -2000;
+//    float Z_s0 = 1730;
+    float Y_s0 = -5000;
+    float Z_s0 = 5000;
 
     float R_0 = sqrt((Y_s0 / 2) * (Y_s0 / 2) + Z_s0 * Z_s0); // 近距延迟 sqrt((y/2)^2 + z^2)
 
@@ -471,7 +570,7 @@ void CPU() {
     }
 
     QueryPerformanceCounter(&iEnd);
-    printf("shadow computing elapsed %f s\n", (double) (iEnd.QuadPart - iStart.QuadPart) / (double) tc.QuadPart);
+    printf("shadow computing elapsed %f s\n", (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart);
 
     /*------------------------------后向散射系数计算---------------------------*/
     QueryPerformanceCounter(&iStart);
@@ -484,10 +583,10 @@ void CPU() {
             // 小面元，取四个点：(0, 0, z1) (m, 0, z2) (m, m, z3) (0, m, z4)，
             // 最小二乘法拟合平面：ax + by + c
             // 论文：《利用 RD 模型和 DEM 数据的高分辨率机载 SAR 图像模拟》 王庆
-            float z1 = cone[x * ny + y];
-            float z2 = cone[(x + 1) * ny + y];
-            float z3 = cone[(x + 1) * ny + (y + 1)];
-            float z4 = cone[x * ny + (y + 1)];
+            float z1 = M[x * ny + y];
+            float z2 = M[(x + 1) * ny + y];
+            float z3 = M[(x + 1) * ny + (y + 1)];
+            float z4 = M[x * ny + (y + 1)];
             // 解得：
             float a = (z2 + z3 - z1 - z4) / (2 * m);
             float b = (z3 + z4 - z1 - z2) / (2 * m);
@@ -506,22 +605,30 @@ void CPU() {
             float theta1 = atan(d * m / (Z_s0 - z0));
 
             // 局部入射角 theta : [-pi/2, pi/2]
-            float theta = acos((abs(b * sin(theta1) + cos(theta1))) / sqrt(a * a + b * b + 1));
+            float theta = 0;
+            float dividend = abs(b * sin(theta1) + cos(theta1));
+            float divisor = sqrt(a * a + b * b + 1);
+            if (abs(dividend - divisor) < 1e-6) { // 防止出现 -nan
+                theta = 0;
+            } else {
+                theta = acos(dividend / divisor);
+            }
 
             // 后向散射系数：Muhleman 半经验模型
 //            sigma[x * ny + y] = 10 * log10(0.0133 * cos(theta) / pow((sin(theta) + 0.1 * cos(theta)), 3));
 
             // currie: 《典型地形的 SAR 回波模拟及快速实现》张吉宇 p25
-            float S = m * m * sqrt(a * a + b * b + 1);
-            float avgh = (z1 + z2 + z3 + z4) / 4;
-            float sigma_h = sqrt((z1 - avgh) * (z1 - avgh) + (z2 - avgh)  * (z2 - avgh) + (z3 - avgh) * (z3 - avgh) + (z4 -avgh) * (z4 - avgh)) / 3;
+            float S = m * m * sqrt(a * a + b * b + 1); // 小面元的截面积
+            float avgh = (z1 + z2 + z3 + z4) / 4; // 高度平均值
+            float sigma_h = sqrt((z1 - avgh) * (z1 - avgh) + (z2 - avgh) * (z2 - avgh) + (z3 - avgh) * (z3 - avgh) +
+                                 (z4 - avgh) * (z4 - avgh)) / 3; // 标准差
             // 树林
             float A = 0.00054;
             float B = 0.64;
             float C = 0.02;
             float D = 0;
 
-            float lambda = 0.06;
+            float lambda = 0.06; // 这个波长需要外面计算好
 
             float sigma_a = A * pow(C + theta, B) * exp(-D * lambda / (0.1 * sigma_h + lambda));
             sigma[x * ny + y] = sigma_a * S * cos(theta) * cos(theta);
@@ -530,13 +637,14 @@ void CPU() {
 
     QueryPerformanceCounter(&iEnd);
     printf("Backscattering coefficient computing elapsed %f s\n",
-           (double) (iEnd.QuadPart - iStart.QuadPart) / (double) tc.QuadPart);
+           (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart);
 
-    /*------------------------------SAR模拟-----------------------------------*/
+    /*------------------------------调整输出图像的大小-------------------------------*/
     QueryPerformanceCounter(&iStart);
 
-    float *img = (float *) malloc(nBytes);
-    memset(img, 0, nBytes);
+    printf("adjusting the size of output image.\n");
+    // 只有图像的宽度范围需要调整
+    int miny = 1e5, maxy = -1e5;
 
     for (int x = 0; x < nx - 1; x++) {
         for (int y = 0; y < ny - 1; y++) {
@@ -544,20 +652,52 @@ void CPU() {
             int Y = ceil(
                     (sqrt((y * m - Y_s0) * (y * m - Y_s0) + (M[x * ny + y] - Z_s0) * (M[x * ny + y] - Z_s0)) - R_0) /
                     M_s);
-            if (Y > 0 && Y < ny) {
-                img[x * ny + Y] += sigma[x * ny + y] * shadow[x * ny + y];
+
+            if (Y < miny) {
+                miny = Y;
+            }
+            if (Y > maxy) {
+                maxy = Y;
             }
         }
     }
 
+    int delta = 100; // 左右留空
+    int imgNx = nx;
+    int imgNy = (maxy - miny) + 2 * delta;
+    int imgSize = imgNx * imgNy;
+
     QueryPerformanceCounter(&iEnd);
-    printf("SAR image simulation elapsed %f s\n", (double) (iEnd.QuadPart - iStart.QuadPart) / (double) tc.QuadPart);
+    printf("\t[ adjusting the size of output image ] \telapsed %f s\n",
+           (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart
+    );
+
+    /*------------------------------SAR模拟-----------------------------------*/
+    QueryPerformanceCounter(&iStart);
+
+    float *img = (float *) malloc(imgSize * sizeof(float));
+    memset(img, 0, imgSize * sizeof(float));
+
+    for (int x = 0; x < nx - 1; x++) {
+        for (int y = 0; y < ny - 1; y++) {
+            // Leberl 构像模型计算模拟 SAR 图像的纵坐标
+            int Y = ceil(
+                    (sqrt((y * m - Y_s0) * (y * m - Y_s0) + (M[x * ny + y] - Z_s0) * (M[x * ny + y] - Z_s0)) - R_0) /
+                    M_s);
+
+            float tmp = sigma[x * ny + y] * shadow[x * ny + y];
+            img[x * imgNy + (Y - miny + delta)] += tmp;
+        }
+    }
+
+    QueryPerformanceCounter(&iEnd);
+    printf("SAR image simulation elapsed %f s\n", (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart);
 
     /*---------------------------------处理+保存--------------------------------------*/
     // 归一化为灰度图像...
 
     // 保存
-    saveMatrix(img, nx, ny, "img");
+    saveMatrix(img, imgNx, imgNy, "img");
 
 
 //    /*--------------------------------回波模拟----------------------------------------*/
@@ -674,7 +814,7 @@ void CPU() {
 //    }
 //     */
 
-    free(cone);
+    free(M);
     free(shadow);
     free(sigma);
     free(img);
