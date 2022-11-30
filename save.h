@@ -12,7 +12,10 @@ using namespace std;
 #define FILEDEM     "dem.csv"
 
 #define FILEIMG     "img.csv"
+
 #define FILEECHO    "echo.csv"
+#define FILEREAL    "echo_real.csv"
+#define FILEIMAG    "echo_imag.csv"
 
 #define FILETMP     "tmp.csv"
 #define FILETMP1    "tmp1.csv"

@@ -10,7 +10,14 @@
 
 #include "save.h"
 
-#define DEBUGTARGET 0
+const float C = 3e8;                        // 光速
+const float Fc = 5e9;                       // 载波频率
+const float lambda = C / Fc;                // 波长
+const float B = 200e6;                      // 带宽
+const float Tp = 1.5e-6;                    // 脉宽
+const float PI = 3.14159265358979323846;    // pi
+
+__device__ int target_count;
 
 #define CHECK(call)                                                            \
 {                                                                              \
@@ -24,6 +31,53 @@
     }                                                                          \
 }
 
+float* imfliter(float *A, int nx, int ny) {
+    float *B = (float *) malloc(nx * ny * sizeof(float));
+
+    for (int i = 0; i < nx; i++) {
+        for (int j = 0; j < ny; j++) {
+            float a00 = 0, a01 = 0, a02 = 0, a10 = 0, a11 = 0, a12 = 0, a20 = 0, a21 = 0, a22 = 0;
+            if (i - 1 >= 0) {
+                if (j - 1 >= 0) {
+                    a00 = A[(i - 1) * ny + (j - 1)];
+                }
+
+                a01 = A[(i - 1) * ny + j];
+
+                if (j + 1 < ny) {
+                    a02 = A[(i - 1) * ny + (j + 1)];
+                }
+            }
+
+            if (j - 1 >= 0) {
+                a10 = A[i * ny + (j - 1)];
+            }
+
+            a11 = A[i * ny + j];
+
+            if (j + 1 < ny) {
+                a12 = A[i * ny + (j + 1)];
+            }
+
+            if (i + 1 < nx) {
+                if (j - 1 >= 0) {
+                    a20 = A[(i + 1) * ny + (j - 1)];
+                }
+
+                a21 = A[(i + 1) * ny + j];
+
+                if (j + 1 < ny) {
+                    a22 = A[(i + 1) * ny + (j + 1)];
+                }
+            }
+
+            B[i * ny + j] = (a00 + a01 + a02 + a10 + a11 + a12 + a20 + a21 + a22) / 9;
+        }
+    }
+
+    return B;
+}
+
 void checkResultGPU(float *hostRef, float *gpuRef, const int N) {
     float epsilon = 1.0E-8;
 
@@ -33,7 +87,7 @@ void checkResultGPU(float *hostRef, float *gpuRef, const int N) {
     for (int i = 0; i < N; i++) {
         if (abs(hostRef[i] - gpuRef[i]) > epsilon) {
             if (printLimit > 0) {
-                printf("host(%d) %f, gpu(%d) %f. ", i, hostRef[i], i, gpuRef[i]);
+                printf("host(%d) %.10f, gpu(%d) %.10f. ", i, hostRef[i], i, gpuRef[i]);
                 printLimit--;
             }
             cnt++;
@@ -107,7 +161,7 @@ __global__ void createConeGPU(float *g_cone, int Nx, int Ny) {
     if (ix < Nx && iy < Ny) {
         g_cone[idx] = 0;
         for (int k = 0; k < 400; k++) {
-            if ((ix - 512) * (ix - 512) + (iy - 700) * (iy - 700) < k * k) {
+            if ((ix - 512) * (ix - 512) + (iy - 512) * (iy - 512) < k * k) {
                 g_cone[idx]++;
             }
         }
@@ -140,7 +194,7 @@ __global__ void shadowComputeGPU(float *g_shadow, int Nx, int Ny, float *M, floa
     }
 }
 
-__global__ void backscatterComputeGPU(float *g_sigma, int Nx, int Ny, float *g_M, float m, float Z_s0) {
+__global__ void backscatterComputeGPU(float *g_sigma, int Nx, int Ny, float *g_M, float m, float Z_s0, float lambda) {
     unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
 //    unsigned int idx = ix * Ny + iy;
@@ -195,17 +249,17 @@ __global__ void backscatterComputeGPU(float *g_sigma, int Nx, int Ny, float *g_M
         float C = 0.02;
         float D = 0;
 
-        float lambda = 0.06; // 这个波长需要外面计算好
+//        float lambda = C / Fc;   // 波长
 
         float sigma_a = A * pow(C + theta, B) * exp(-D * lambda / (0.1 * sigma_h + lambda));
         g_sigma[x * Ny + y] = sigma_a * S * cos(theta) * cos(theta);
     }
 }
 
-__global__ void
-imageSimulationGPU(float *g_img, int imgNy, int miny, int delta, int Nx, int Ny, float *g_M, float *g_sigma,
-                   float *g_shadow,
-                   float m, float Y_s0, float Z_s0, float R_0, float M_s) {
+__global__ void imageSimulationGPU(float *g_img, int imgNy, int miny, int delta, int Nx, int Ny,
+                                   float *g_M, float *g_sigma, float *g_shadow,
+                                   float m, float Y_s0, float Z_s0, float R_0, float M_s) {
+
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -215,6 +269,38 @@ imageSimulationGPU(float *g_img, int imgNy, int miny, int delta, int Nx, int Ny,
                 (sqrt((y * m - Y_s0) * (y * m - Y_s0) + (g_M[x * Ny + y] - Z_s0) * (g_M[x * Ny + y] - Z_s0)) - R_0) /
                 M_s);
         atomicAdd(&g_img[x * imgNy + (Y - miny + delta)], g_sigma[x * Ny + y] * g_shadow[x * Ny + y]);
+    }
+}
+
+__global__ void createEchoGPU(float *g_real, float *g_imag, float *g_target, float *g_tk, float *g_y,
+                              int target_size, int tk_size, float H, float Kr, float Xc,
+                              float C, float Fc, float PI, float Tp) {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    for (int k = 0; k < target_size; k++) { // 目标数
+        float Xs = g_target[k * 4 + 0];
+        float Ys = g_target[k * 4 + 1];
+        float Zs = g_target[k * 4 + 2];
+        float sigma = g_target[k * 4 + 3];
+
+        if (sigma == 0) continue;
+
+        float Rtm = sqrt(Xs * Xs + (Ys - g_y[i]) * (Ys - g_y[i]) + (Zs - H) * (Zs - H));
+
+        if ((abs(g_target[k * 4 + 1] - g_y[i]) / Xc) < 0.01) { // 假定波束宽度是0.02°
+            float rec = 0;
+            if (abs(g_tk[j] - 2 * Rtm / C) < Tp / 2) {
+                rec = 1;
+            }
+            float exp_real = cos(2 * PI * Fc * (g_tk[j] - 2 * Rtm / C) +
+                                 PI * Kr * (g_tk[j] - 2 * Rtm / C) * (g_tk[j] - 2 * Rtm / C));
+            float exp_imag = sin(2 * PI * Fc * (g_tk[j] - 2 * Rtm / C) +
+                                 PI * Kr * (g_tk[j] - 2 * Rtm / C) * (g_tk[j] - 2 * Rtm / C));
+            atomicAdd(&g_real[i * tk_size + j], sigma * rec * exp_real);
+            atomicAdd(&g_imag[i * tk_size + j], sigma * rec * exp_imag);
+        }
     }
 }
 
@@ -230,60 +316,19 @@ void GPU() {
     LARGE_INTEGER iStart, iEnd, tc;
     QueryPerformanceFrequency(&tc);
 
-//    /*---------------------------create a cone model----------------------*/
-//    const int cone_row = 1024, cone_col = 2000;
-//    int nx = cone_row, ny = cone_col;
-//    int nxy = nx * ny;
-//    int nBytes = nxy * sizeof(float);
-//
-//    float *cone = (float *) malloc(nBytes);
-//    memset(cone, 0, nBytes);
-//
-//    // allocate device memory
-//    float *g_cone = NULL;
-//    cudaMalloc((void **) &g_cone, nBytes);
-//
-//    // execution configuration
-//    int dimx = 32;
-//    int dimy = 32;
-//    dim3 block(dimx, dimy);
-//    dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
-//
-//    // kernel: createConeGPU
-//    QueryPerformanceCounter(&iStart);
-//
-//    createConeGPU<<<grid, block>>>(g_cone, cone_row, cone_col);
-//
-//    CHECK(cudaDeviceSynchronize());
-//    QueryPerformanceCounter(&iEnd);
-//    printf("\t[ createConeGPU\t\t<<<(%d,%d), (%d,%d)>>> ] \telapsed %f s\n",
-//           grid.x, grid.y, block.x, block.y,
-//           (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart
-//    );
-//
-//    CHECK(cudaGetLastError());
-//
-//    // copy kernel result back to host side
-//    CHECK(cudaMemcpy(cone, g_cone, nBytes, cudaMemcpyDeviceToHost));
 
-    /*------------------------------导入数据-----------------------------------*/
-    QueryPerformanceCounter(&iStart);
-
-    int nx = 0, ny = 0;
-    vector<float> DEM = load(nx, ny);
+    /*---------------------------create a cone model----------------------*/
+    const int cone_row = 1024, cone_col = 1400;
+    int nx = cone_row, ny = cone_col;
     int nxy = nx * ny;
     int nBytes = nxy * sizeof(float);
 
     float *M = (float *) malloc(nBytes);
+    memset(M, 0, nBytes);
 
-    for (int i = 0; i < nxy; i++) {
-        M[i] = DEM[i];
-    }
-
-    // copy data to device side
+    // allocate device memory
     float *g_M = NULL;
-    CHECK(cudaMalloc((void **) &g_M, nBytes));
-    CHECK(cudaMemcpy(g_M, M, nBytes, cudaMemcpyHostToDevice));
+    cudaMalloc((void **) &g_M, nBytes);
 
     // execution configuration
     int dimx = 32;
@@ -291,17 +336,63 @@ void GPU() {
     dim3 block(dimx, dimy);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
+    // kernel: createConeGPU
+    QueryPerformanceCounter(&iStart);
+
+    createConeGPU<<<grid, block>>>(g_M, nx, ny);
+
+    CHECK(cudaDeviceSynchronize());
     QueryPerformanceCounter(&iEnd);
-    printf("\t[ loading DEM data ] \t\t\t\t\telapsed %f s\n\n", (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart);
+    printf("\t[ createConeGPU\t\t<<<(%d,%d), (%d,%d)>>> ] \telapsed %f s\n",
+           grid.x, grid.y, block.x, block.y,
+           (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart
+    );
+
+    CHECK(cudaGetLastError());
+
+    // copy kernel result back to host side
+    CHECK(cudaMemcpy(M, g_M, nBytes, cudaMemcpyDeviceToHost));
+
+//    saveMatrix(M, nx, ny, "tmp");
+
+//    /*------------------------------导入数据-----------------------------------*/
+//    QueryPerformanceCounter(&iStart);
+//
+//    int nx = 0, ny = 0;
+//    vector<float> DEM = load(nx, ny);
+//    int nxy = nx * ny;
+//    int nBytes = nxy * sizeof(float);
+//
+//    float *M = (float *) malloc(nBytes);
+//
+//    for (int i = 0; i < nxy; i++) {
+//        M[i] = DEM[i];
+//    }
+//
+//    // copy data to device side
+//    float *g_M = NULL;
+//    CHECK(cudaMalloc((void **) &g_M, nBytes));
+//    CHECK(cudaMemcpy(g_M, M, nBytes, cudaMemcpyHostToDevice));
+//
+//    QueryPerformanceCounter(&iEnd);
+//    printf("\t[ loading DEM data ] \t\t\t\t\telapsed %f s\n\n",
+//           (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart);
+//
+//    /*------------------------------GPU参数-----------------------------------*/
+//    // execution configuration
+//    int dimx = 32;
+//    int dimy = 32;
+//    dim3 block(dimx, dimy);
+//    dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
     /*------------------------------雷达参数-----------------------------------*/
     // 雷达初始位置
     float X_s0 = 0;
-//    float Y_s0 = -2000;
-//    float Z_s0 = 1730;
+    float Y_s0 = -2000;
+    float Z_s0 = 1730;
 
-    float Y_s0 = -5000;
-    float Z_s0 = 5000;
+//    float Y_s0 = -5000;
+//    float Z_s0 = 5000;
 
     float R_0 = sqrt((Y_s0 / 2) * (Y_s0 / 2) + Z_s0 * Z_s0); // 近距延迟 sqrt((y/2)^2 + z^2)
 
@@ -354,7 +445,7 @@ void GPU() {
     // kernel: backscatterComputeGPU
     QueryPerformanceCounter(&iStart);
 
-    backscatterComputeGPU<<<grid, block>>>(g_sigma, nx, ny, g_M, m, Z_s0);
+    backscatterComputeGPU<<<grid, block>>>(g_sigma, nx, ny, g_M, m, Z_s0, lambda);
 
     CHECK(cudaDeviceSynchronize());
     QueryPerformanceCounter(&iEnd);
@@ -444,20 +535,165 @@ void GPU() {
            (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart
     );
 
-    printf("done.\n");
+    printf("done.\n\n");
+
+    /*--------------------------------回波模拟----------------------------------------*/
+
+    printf("echo simulating...\n");
+
+    /*--------------------------------数据预处理--------------------------------------*/
+
+    int target_size = nxy;
+    float *target = (float *) malloc(target_size * 4 * sizeof(float));
+    memset(target, 0, target_size * 4 * sizeof(float));
+    int idx = 0;
+    for (int i = 0; i < nx; i++) {
+        for (int j = 0; j < ny; j++) {
+            target[idx * 4 + 0] = j - ny / 2;
+            target[idx * 4 + 1] = i - nx / 2;
+            target[idx * 4 + 2] = M[i * ny + j];
+            target[idx * 4 + 3] = sigma[i * ny + j] * shadow[i * ny + j];
+            idx++;
+        }
+    }
+
+//    saveMatrix(target, target_size, 4, "tmp");
+
+//    float target[12] = {0, 0, 0, 2,
+//                        80, 45, 0, -2,
+//                        -20, -20, 0, -10};
+//    int target_size = 3;
+
+
+    /*--------------------------------雷达参数----------------------------------------*/
+    float Kr = B / Tp;    // 调频率
+    float fs = 1.6 * B;     // 采样率
+
+    float H = 1730;     // 飞机高度
+    float Ls = 200;     // 合成孔径长度
+    float v = 100;      // 飞机速度
+    float Lt = Ls / v;    // 合成孔径时间
+
+    // 成像区域[Xc-X0,Xc+X0; Yc-Y0,Yc+Y0]
+    // 以合成孔径中心为原点，距离向为x轴，方位向为y轴
+    float Xc = 2000;
+    float Yc = 0;
+    float Xo = 700;
+    float Yo = 512;
+
+
+    for (int i = 0; i < target_size; i++) {
+        target[i * 4 + 0] += Xc;
+        target[i * 4 + 1] += Yc;
+    }
+
+    float Rc = sqrt(H * H + Xc * Xc);     // 中心距离
+    float Ka = 2 * v * v / (Rc * lambda);   // 多普勒调频率
+    float Bmax = Lt * Ka;            // 多普勒最大带宽
+    float fa = ceil(3 * Bmax);       // 脉冲重复频率
+
+    float Rmin = sqrt(H * H + (Xc - Xo) * (Xc - Xo));   // 观测场景距飞机的最近距离
+    float Rmax = sqrt((Xc + Xo) * (Xc + Xo) + H * H + (Yc + Yo + Ls / 2) * (Yc + Yo + Ls / 2));  // 最远距离
+    float rm = Ls + 2 * Yo;    // 雷达走过的总路程长度
+
+    int tm_size = (rm * fa) / v;
+    float *tm = (float *) malloc(tm_size * sizeof(float));                  // 慢时间（合成孔径时间+成像区域时间）
+    for (int i = 0; i < tm_size; i++) {
+        tm[i] = i / fa;
+    }
+
+    int tk_size = (2 * Rmax / C - 2 * Rmin / C + Tp) * fs;
+    float *tk = (float *) malloc(tk_size * sizeof(float));       // 快时间（距离门内）
+    for (int i = 0; i < tk_size; i++) {
+        tk[i] = (2 * Rmin / C - Tp / 2) + i / fs;
+    }
+
+    float *echo_real = (float *) malloc(tm_size * tk_size * sizeof(float)); // 回波
+    memset(echo_real, 0, tm_size * tk_size * sizeof(float));
+
+    float *echo_imag = (float *) malloc(tm_size * tk_size * sizeof(float)); // 回波
+    memset(echo_imag, 0, tm_size * tk_size * sizeof(float));
+
+    float *y = (float *) malloc(tm_size * sizeof(float)); // 飞机y轴坐标
+    for (int i = 0; i < tm_size; i++) {
+        y[i] = -v * (rm / v) / 2 + v * tm[i];
+    }
+
+    /*--------------------------------生成回波----------------------------------------*/
+
+    int val = target_size;
+    CHECK(cudaMemcpyToSymbol(target_count, &val, sizeof(int)));
+
+    // allocate device memory
+    float *g_real = NULL;
+    CHECK(cudaMalloc((void **) &g_real, tm_size * tk_size * sizeof(float)));
+
+    float *g_imag = NULL;
+    CHECK(cudaMalloc((void **) &g_imag, tm_size * tk_size * sizeof(float)));
+
+    float *g_target = NULL;
+    CHECK(cudaMalloc((void **) &g_target, target_size * 4 * sizeof(float)));
+    CHECK(cudaMemcpy(g_target, target, target_size * 4 * sizeof(float), cudaMemcpyHostToDevice));
+
+    float *g_tk = NULL;
+    CHECK(cudaMalloc((void **) &g_tk, tk_size * sizeof(float)));
+    CHECK(cudaMemcpy(g_tk, tk, tk_size * sizeof(float), cudaMemcpyHostToDevice));
+
+    float *g_y = NULL;
+    CHECK(cudaMalloc((void **) &g_y, tm_size * sizeof(float)));
+    CHECK(cudaMemcpy(g_y, y, tm_size * sizeof(float), cudaMemcpyHostToDevice));
+
+    // execution configuration
+    grid.x = (block.x + tm_size - 1) / block.x;
+    grid.y = (block.y + tk_size - 1) / block.y;
+
+    // kernel: createEchoGPU
+    QueryPerformanceCounter(&iStart);
+
+    createEchoGPU<<<grid, block>>>(g_real, g_imag, g_target, g_tk, g_y, target_size, tk_size, H, Kr, Xc, C, Fc, PI, Tp);
+
+    CHECK(cudaDeviceSynchronize());
+    QueryPerformanceCounter(&iEnd);
+    printf("\t[ createEchoGPU\t<<<(%d,%d), (%d,%d)>>> ] \telapsed %f s\n\n",
+           grid.x, grid.y, block.x, block.y,
+           (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart
+    );
+
+    CHECK(cudaGetLastError());
+
+    // copy kernel result back to host side
+    CHECK(cudaMemcpy(echo_real, g_real, tm_size * tk_size * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(echo_imag, g_imag, tm_size * tk_size * sizeof(float), cudaMemcpyDeviceToHost));
+
+    saveMatrix(echo_real, tm_size, tk_size, "real");
+    saveMatrix(echo_imag, tm_size, tk_size, "imag");
+
     /*-----------------------------------释放资源---------------------------*/
     free(M);
     free(shadow);
     free(sigma);
     free(img);
+    free(target);
+    free(tm);
+    free(tk);
+    free(y);
+    free(echo_real);
+    free(echo_imag);
 
     CHECK(cudaFree(g_M));
     CHECK(cudaFree(g_shadow));
     CHECK(cudaFree(g_sigma));
     CHECK(cudaFree(g_img));
+    CHECK(cudaFree(g_target));
+    CHECK(cudaFree(g_tk));
+    CHECK(cudaFree(g_y));
+    CHECK(cudaFree(g_real));
+    CHECK(cudaFree(g_imag));
 }
 
 void CPU();
+
+void echo_test();
 
 int main(int argc, char **argv) {
     if (argc > 1) {
@@ -473,6 +709,7 @@ int main(int argc, char **argv) {
     // default
 //    CPU();
     GPU();
+//    echo_test();
     return 0;
 }
 
@@ -490,15 +727,15 @@ void CPU() {
 //    int nxy = nx * ny;
 //    int nBytes = nxy * sizeof(float);
 //
-//    float *cone = (float *) malloc(nBytes);
+//    float *M = (float *) malloc(nBytes);
 //
-//    memset(cone, 0, nBytes);
+//    memset(M, 0, nBytes);
 //
 //    for (int i = 0; i < nx; i++) {
 //        for (int j = 0; j < ny; j++) {
 //            for (int k = 0; k < 400; k++) {
 //                if ((i - 512) * (i - 512) + (j - 700) * (j - 700) < k * k) {
-//                    cone[i * ny + j]++;
+//                    M[i * ny + j]++;
 //                }
 //            }
 //        }
@@ -506,7 +743,7 @@ void CPU() {
 //    QueryPerformanceCounter(&iEnd);
 //    printf("create cone elapsed %f s\n", (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart);
 //
-////    saveMatrix(cone, nx, ny, "gpuCone");
+////    saveMatrix(M, nx, ny, "gpuCone");
 
     /*------------------------------导入数据-----------------------------------*/
     QueryPerformanceCounter(&iStart);
@@ -526,8 +763,6 @@ void CPU() {
     printf("loading DEM data elapsed %f s\n", (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart);
 
     /*------------------------------雷达参数-----------------------------------*/
-
-//    float *M = cone; // load data
 
     // 雷达初始位置
     float X_s0 = 0;
@@ -628,7 +863,7 @@ void CPU() {
             float C = 0.02;
             float D = 0;
 
-            float lambda = 0.06; // 这个波长需要外面计算好
+            float lambda = C / Fc;   // 波长
 
             float sigma_a = A * pow(C + theta, B) * exp(-D * lambda / (0.1 * sigma_h + lambda));
             sigma[x * ny + y] = sigma_a * S * cos(theta) * cos(theta);
@@ -699,127 +934,165 @@ void CPU() {
     // 保存
     saveMatrix(img, imgNx, imgNy, "img");
 
-
-//    /*--------------------------------回波模拟----------------------------------------*/
-//    printf("echo simulating...\n");
-//    /*--------------------------------数据预处理--------------------------------------*/
-//
-//    float *mat = (float *) malloc(nBytes);
-//    for (int i = 0; i < nx; i++) {
-//        for (int j = 0; j < ny; j++) {
-//            mat[i * ny + j] = sigma[i * ny + j] * shadow[i * ny + j];
-//        }
-//    }
-//    saveMatrix(mat, nx, ny, "mat");
-//
-//#ifdef DEBUGTARGET
-//    nxy = 3;
-//    nBytes = nxy * sizeof(float);
-//    float *target = (float *) malloc(nBytes * 4);
-//    memset(target, 0, sizeof target);
-//
-//    target[0] = 0;
-//    target[1] = 0;
-//    target[2] = 0;
-//    target[3] = 2;
-//    target[4] = 80;
-//    target[5] = 45;
-//    target[6] = 0;
-//    target[7] = -2;
-//    target[8] = -20;
-//    target[9] = -20;
-//    target[10] = 0;
-//    target[11] = 10;
-//
-//#else
-//    float *target = (float *) malloc(nBytes * 4);
-//    memset(target, 0, sizeof target);
-//    int idx = 0;
-//    for (int i = 0; i < nx; i++) {
-//        for (int j = 0; j < ny; j++) {
-//            target[idx * 4 + 0] = j - ny / 2;
-//            target[idx * 4 + 1] = i - nx / 2;
-//            target[idx * 4 + 2] = M[i * ny + j];
-//            target[idx * 4 + 3] = sigma[i * ny + j] * shadow[i * ny + j];
-//        }
-//    }
-//#endif
-//
-//
-//    /*--------------------------------雷达参数----------------------------------------*/
-//    float c = 3e8; // 光速
-//    float fc = 5e9; // 载波频率
-//    float B = 200e6; // 带宽
-//
-//    float lambda = c / fc;   // 波长
-//    float Tp = 1.5e-6;    // 脉宽
-//    float Kr = B / Tp;    // 调频率
-//    float fs = 1.6 * B;     // 采样率
-//
-//    float H = 1730;     // 飞机高度
-//    float Ls = 200;     // 合成孔径长度
-//    float v = 100;      // 飞机速度
-//    float Lt = Ls / v;    // 合成孔径时间
-//
-//    // 成像区域[Xc-X0,Xc+X0; Yc-Y0,Yc+Y0]
-//    // 以合成孔径中心为原点，距离向为x轴，方位向为y轴
-//    float Xc = 2000;
-//    float Yc = 0;
-//    float Xo = 200;
-//    float Yo = 200;
-//
-//
-//    for (int i = 0; i < nxy; i++) {
-//        target[i * 4 + 0] *= Xc;
-//        target[i * 4 + 1] *= Yc;
-//    }
-//
-//    float Rc = sqrt(H * H + Xc * Xc);     // 中心距离
-//    float Ka = 2 * v * v / (Rc * lambda);   // 多普勒调频率
-//    float Bmax = Lt * Ka;            // 多普勒最大带宽
-//    float fa = ceil(3 * Bmax);       // 脉冲重复频率
-//
-//    float Rmin = sqrt(H * H + (Xc - Xo) * (Xc - Xo));   // 观测场景距飞机的最近距离
-//    float Rmax = sqrt((Xc + Xo) * (Xc + Xo) + H * H + (Yc + Yo + Ls / 2) * (Yc + Yo + Ls / 2));  // 最远距离
-//    float rm = Ls + 2 * Yo;    // 雷达走过的总路程长度
-//
-//    int len_tm = (rm * fa) / v;
-//    float *tm = (float *) malloc(len_tm * sizeof(float));                  // 慢时间（合成孔径时间+成像区域时间）
-//    for (int i = 0; i < len_tm; i++) {
-//        tm[i] = i / fa;
-//    }
-//
-//    int len_tk = (2 * Rmax / c - 2 * Rmin / c + Tp) * fs;
-//    float *tk = (float *) malloc(len_tk * sizeof(float));       // 快时间（距离门内）
-//    for (int i = 0; i < len_tk; i++) {
-//        tk[i] = (2 * Rmin / c - Tp / 2) + i / fs;
-//    }
-//
-//    float *echo_all = (float *) malloc(len_tm * len_tk * sizeof(float)); // 回波
-//    float *y = (float *) malloc(len_tm * sizeof(float)); // 飞机y轴坐标
-//    for (int i = 0; i < len_tm; i++) {
-//        y[i] = -v * (rm / v) / 2 + v * tm[i];
-//    }
-//
-//    /*
-//    for (int k = 0; k < nxy; k++) { // 目标数
-//        for (int i = 0; i < len_tm; i++) { // 慢时间轴
-//            sigma = target(k, 4);
-//            if (sigma == 0) continue;
-////
-////            radar = [0,y(i),H ];      %飞机坐标
-////            Rtm = sqrt(sum((target(k,1:3)-radar).^2));
-////            echo_all(i,:) = echo_all(i,:) + sigma * (abs(target(k,2)-y(i))/Xc < 0.01)*rectpuls(tk-2*Rtm/c,Tp).* exp(1j*2*pi*fc*(tk-2*Rtm/c)+1j*pi*Kr*(tk-2*Rtm/c).^2);  %回波模型
-//        }
-//    }
-//     */
-
     free(M);
     free(shadow);
     free(sigma);
     free(img);
-//    free(target);
-//    free(tm);
-//    free(tk);
-//    free(echo_all);
+}
+
+void echo_test() {
+    /*--------------------------------回波模拟----------------------------------------*/
+    printf("echo simulating...\n");
+
+    // set timer
+    LARGE_INTEGER iStart, iEnd, tc;
+    QueryPerformanceFrequency(&tc);
+
+    /*--------------------------------数据预处理--------------------------------------*/
+
+    float target[12] = {0, 0, 0, 2,
+                        80, 45, 0, -2,
+                        -20, -20, 0, -10};
+    int target_size = 3;
+
+
+    /*--------------------------------雷达参数----------------------------------------*/
+    float Kr = B / Tp;    // 调频率
+    float fs = 1.6 * B;     // 采样率
+
+    float H = 1730;     // 飞机高度
+    float Ls = 200;     // 合成孔径长度
+    float v = 100;      // 飞机速度
+    float Lt = Ls / v;    // 合成孔径时间
+
+    // 成像区域[Xc-X0,Xc+X0; Yc-Y0,Yc+Y0]
+    // 以合成孔径中心为原点，距离向为x轴，方位向为y轴
+    float Xc = 2000;
+    float Yc = 0;
+    float Xo = 100;
+    float Yo = 100;
+
+
+    for (int i = 0; i < target_size; i++) {
+        target[i * 4 + 0] += Xc;
+        target[i * 4 + 1] += Yc;
+    }
+
+    float Rc = sqrt(H * H + Xc * Xc);     // 中心距离
+    float Ka = 2 * v * v / (Rc * lambda);   // 多普勒调频率
+    float Bmax = Lt * Ka;            // 多普勒最大带宽
+    float fa = ceil(3 * Bmax);       // 脉冲重复频率
+
+    float Rmin = sqrt(H * H + (Xc - Xo) * (Xc - Xo));   // 观测场景距飞机的最近距离
+    float Rmax = sqrt((Xc + Xo) * (Xc + Xo) + H * H + (Yc + Yo + Ls / 2) * (Yc + Yo + Ls / 2));  // 最远距离
+    float rm = Ls + 2 * Yo;    // 雷达走过的总路程长度
+
+    int tm_size = (rm * fa) / v;
+    float *tm = (float *) malloc(tm_size * sizeof(float));                  // 慢时间（合成孔径时间+成像区域时间）
+    for (int i = 0; i < tm_size; i++) {
+        tm[i] = i / fa;
+    }
+
+    int tk_size = (2 * Rmax / C - 2 * Rmin / C + Tp) * fs;
+    float *tk = (float *) malloc(tk_size * sizeof(float));       // 快时间（距离门内）
+    for (int i = 0; i < tk_size; i++) {
+        tk[i] = (2 * Rmin / C - Tp / 2) + i / fs;
+    }
+
+    float *echo_real = (float *) malloc(tm_size * tk_size * sizeof(float)); // 回波
+    memset(echo_real, 0, tm_size * tk_size * sizeof(float));
+
+    float *echo_imag = (float *) malloc(tm_size * tk_size * sizeof(float)); // 回波
+    memset(echo_imag, 0, tm_size * tk_size * sizeof(float));
+
+    float *y = (float *) malloc(tm_size * sizeof(float)); // 飞机y轴坐标
+    for (int i = 0; i < tm_size; i++) {
+        y[i] = -v * (rm / v) / 2 + v * tm[i];
+    }
+
+    for (int i = 0; i < tm_size; i++) { // 慢时间轴
+        for (int j = 0; j < tk_size; j++) { // 快时间轴
+            for (int k = 0; k < target_size; k++) { // 目标数
+                float Xs = target[k * 4 + 0];
+                float Ys = target[k * 4 + 1];
+                float Zs = target[k * 4 + 2];
+                float sigma = target[k * 4 + 3];
+
+                if (sigma == 0) continue;
+
+                float Rtm = sqrt(pow(Xs, 2) + pow(Ys - y[i], 2) + pow(Zs - H, 2));
+
+                if ((abs(target[k * 4 + 1] - y[i]) / Xc) < 0.01) { // 假定波束宽度是0.02°
+                    float rec = 0;
+                    if (abs(tk[j] - 2 * Rtm / C) < Tp / 2) {
+                        rec = 1;
+                    }
+                    float exp_real = cos(2 * PI * Fc * (tk[j] - 2 * Rtm / C) + PI * Kr * pow(tk[j] - 2 * Rtm / C, 2));
+                    float exp_imag = sin(2 * PI * Fc * (tk[j] - 2 * Rtm / C) + PI * Kr * pow(tk[j] - 2 * Rtm / C, 2));
+                    echo_real[i * tk_size + j] += sigma * rec * exp_real;
+                    echo_imag[i * tk_size + j] += sigma * rec * exp_imag;
+                }
+            }
+        }
+    }
+
+//    saveMatrix(echo_real, tm_size, tk_size, "real");
+//    saveMatrix(echo_imag, tm_size, tk_size, "imag");
+
+    // GPU
+
+    float *test_real = (float *) malloc(tm_size * tk_size * sizeof(float)); // 回波
+    memset(test_real, 0, tm_size * tk_size * sizeof(float));
+
+    float *test_imag = (float *) malloc(tm_size * tk_size * sizeof(float)); // 回波
+    memset(test_imag, 0, tm_size * tk_size * sizeof(float));
+
+    // allocate device memory
+    float *g_real = NULL;
+    CHECK(cudaMalloc((void **) &g_real, tm_size * tk_size * sizeof(float)));
+
+    float *g_imag = NULL;
+    CHECK(cudaMalloc((void **) &g_imag, tm_size * tk_size * sizeof(float)));
+
+    float *g_target = NULL;
+    CHECK(cudaMalloc((void **) &g_target, target_size * 4 * sizeof(float)));
+    CHECK(cudaMemcpy(g_target, target, target_size * 4 * sizeof(float), cudaMemcpyHostToDevice));
+
+    float *g_tk = NULL;
+    CHECK(cudaMalloc((void **) &g_tk, tk_size * sizeof(float)));
+    CHECK(cudaMemcpy(g_tk, tk, tk_size * sizeof(float), cudaMemcpyHostToDevice));
+
+    float *g_y = NULL;
+    CHECK(cudaMalloc((void **) &g_y, tm_size * sizeof(float)));
+    CHECK(cudaMemcpy(g_y, y, tm_size * sizeof(float), cudaMemcpyHostToDevice));
+
+    // execution configuration
+    int dimx = 32;
+    int dimy = 32;
+    dim3 block(dimx, dimy);
+    dim3 grid((block.x + tm_size - 1) / block.x, (block.y + tk_size - 1) / block.x);
+
+    // kernel: createEchoGPU
+    QueryPerformanceCounter(&iStart);
+
+    createEchoGPU<<<grid, block>>>(g_real, g_imag, g_target, g_tk, g_y, target_size, tk_size, H, Kr, Xc, C, Fc, PI, Tp);
+
+    CHECK(cudaDeviceSynchronize());
+    QueryPerformanceCounter(&iEnd);
+    printf("\t[ createEchoGPU\t<<<(%d,%d), (%d,%d)>>> ] \telapsed %f s\n\n",
+           grid.x, grid.y, block.x, block.y,
+           (float) (iEnd.QuadPart - iStart.QuadPart) / (float) tc.QuadPart
+    );
+
+    CHECK(cudaGetLastError());
+
+    // copy kernel result back to host side
+    CHECK(cudaMemcpy(test_real, g_real, tm_size * tk_size * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(test_imag, g_imag, tm_size * tk_size * sizeof(float), cudaMemcpyDeviceToHost));
+
+    checkResultGPU(echo_real, test_real, tm_size * tk_size);
+    checkResultGPU(echo_imag, test_imag, tm_size * tk_size);
+
+    saveMatrix(test_real, tm_size, tk_size, "real");
+    saveMatrix(test_imag, tm_size, tk_size, "imag");
 }

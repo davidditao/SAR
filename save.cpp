@@ -35,6 +35,10 @@ void saveMatrix(float *matrix, int nx, int ny, string name) {
         ofs.open(FILETMP1, ofstream::out);
     } else if (name == "tmp2") {
         ofs.open(FILETMP2, ofstream::out);
+    } else if (name == "real") {
+        ofs.open(FILEREAL, ofstream::out);
+    } else if (name == "imag") {
+        ofs.open(FILEIMAG, ofstream::out);
     } else {
         ofs.open(FILETMP, ofstream::out);
     }
@@ -75,7 +79,7 @@ vector<float> load(int &nx, int &ny) {
             res.push_back(atof(num.c_str()));
         }
     }
-    ny = (int)res.size() / nx;
+    ny = (int) res.size() / nx;
 
     ifs.close();
 
