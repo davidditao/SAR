@@ -10,6 +10,9 @@
 
 #include "save.h"
 
+// 开启回波模拟
+#define ECHO_SIMU_GPU
+
 const float C = 3e8;                        // 光速
 const float Fc = 5e9;                       // 载波频率
 const float lambda = C / Fc;                // 波长
@@ -31,6 +34,7 @@ __device__ int target_count;
     }                                                                          \
 }
 
+// 均值滤波
 float* imfliter(float *A, int nx, int ny) {
     float *B = (float *) malloc(nx * ny * sizeof(float));
 
@@ -76,6 +80,28 @@ float* imfliter(float *A, int nx, int ny) {
     }
 
     return B;
+}
+
+// 归一化
+void normalized(float *img, int nx, int ny) {
+    float minVal = 1e5, maxVal = -1e5;
+    for (int i = 0; i < nx; i++) {
+        for (int j = 0; j < ny; j++) {
+            if (img[i * ny + j] < minVal) {
+                minVal = img[i * ny + j];
+            }
+            if (img[i * ny + j] > maxVal) {
+                maxVal = img[i * ny + j];
+            }
+
+        }
+    }
+
+    for (int i = 0; i < nx; i++) {
+        for (int j = 0; j < ny; j++) {
+            img[i * ny + j] = (img[i * ny + j] - minVal) * 255 / (maxVal - minVal);
+        }
+    }
 }
 
 void checkResultGPU(float *hostRef, float *gpuRef, const int N) {
@@ -521,10 +547,14 @@ void GPU() {
     // copy kernel result back to host side
     CHECK(cudaMemcpy(img, g_img, imgSize * sizeof(float), cudaMemcpyDeviceToHost));
 
-    /*-----------------------------------------------------------------------*/
-    // 归一化为灰度图像
+    /*-------------------------------图像处理---------------------------------*/
+    // 均值滤波
+    img = imfliter(img, imgNx, imgNy);
 
-    /*-----------------------------------保存图像----------------------------*/
+    // 归一化为灰度图像（可用并行化优化）
+    normalized(img, imgNx, imgNy);
+
+    /*-------------------------------保存图像---------------------------------*/
     QueryPerformanceCounter(&iStart);
 
     saveMatrix(img, imgNx, imgNy, "img");
@@ -538,11 +568,18 @@ void GPU() {
     printf("done.\n\n");
 
     /*--------------------------------回波模拟----------------------------------------*/
+#ifdef ECHO_SIMU_GPU
 
     printf("echo simulating...\n");
 
     /*--------------------------------数据预处理--------------------------------------*/
+    // 均值滤波
+    sigma = imfliter(sigma, nx, ny);
 
+    // 归一化
+    normalized(sigma, nx, ny);
+
+    // 生成数据
     int target_size = nxy;
     float *target = (float *) malloc(target_size * 4 * sizeof(float));
     memset(target, 0, target_size * 4 * sizeof(float));
@@ -576,7 +613,7 @@ void GPU() {
 
     // 成像区域[Xc-X0,Xc+X0; Yc-Y0,Yc+Y0]
     // 以合成孔径中心为原点，距离向为x轴，方位向为y轴
-    float Xc = 2000;
+    float Xc = 2500;
     float Yc = 0;
     float Xo = 700;
     float Yo = 512;
@@ -665,30 +702,38 @@ void GPU() {
     CHECK(cudaMemcpy(echo_real, g_real, tm_size * tk_size * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK(cudaMemcpy(echo_imag, g_imag, tm_size * tk_size * sizeof(float), cudaMemcpyDeviceToHost));
 
+    // save
     saveMatrix(echo_real, tm_size, tk_size, "real");
     saveMatrix(echo_imag, tm_size, tk_size, "imag");
+#endif
 
     /*-----------------------------------释放资源---------------------------*/
     free(M);
     free(shadow);
     free(sigma);
     free(img);
+
+#ifdef ECHO_SIMU_GPU
     free(target);
     free(tm);
     free(tk);
     free(y);
     free(echo_real);
     free(echo_imag);
+#endif
 
     CHECK(cudaFree(g_M));
     CHECK(cudaFree(g_shadow));
     CHECK(cudaFree(g_sigma));
     CHECK(cudaFree(g_img));
+
+#ifdef ECHO_SIMU_GPU
     CHECK(cudaFree(g_target));
     CHECK(cudaFree(g_tk));
     CHECK(cudaFree(g_y));
     CHECK(cudaFree(g_real));
     CHECK(cudaFree(g_imag));
+#endif
 }
 
 void CPU();
